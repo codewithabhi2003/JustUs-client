@@ -8,126 +8,157 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-  ]
+  ],
 };
 
-export const useWebRTC = (targetUserId) => {
-  const peerRef         = useRef(null);
-  const localStreamRef  = useRef(null);
-  const localVideoRef   = useRef(null);
-  const remoteVideoRef  = useRef(null);
-
-  // ── FIX 2: ICE queue ──────────────────────────────────────────────────────
-  const pendingIce      = useRef([]);
-  const remoteReady     = useRef(false);  // true once setRemoteDescription is done
+export const useWebRTC = () => {
+  const peerRef          = useRef(null);
+  const localStreamRef   = useRef(null);
+  const localVideoRef    = useRef(null);
+  const remoteVideoRef   = useRef(null);
+  const pendingIce       = useRef([]);
+  const remoteReady      = useRef(false);
+  const isEndingCall     = useRef(false);   // prevents double-fire from peer.close()
+  const targetUserIdRef  = useRef(null);    // mutable — avoids stale closures
 
   const [isMuted,  setIsMuted]  = useState(false);
   const [isCamOff, setIsCamOff] = useState(false);
 
-  const { setCallState, setCallType, resetCall } = useCallStore();
+  const {
+    setCallState, setCallType, setRemoteUser,
+    setIncomingOffer, resetCall,
+  } = useCallStore();
 
-  // ── helpers ───────────────────────────────────────────────────────────────
-
+  // ─── media ──────────────────────────────────────────────────────────────────
   const getMedia = async (callType) => {
-    const constraints = callType === 'video'
-      ? { audio: { echoCancellation: true, noiseSuppression: true }, video: true }
-      : { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
-    return await navigator.mediaDevices.getUserMedia(constraints);
+    const stream = await navigator.mediaDevices.getUserMedia(
+      callType === 'video'
+        ? { audio: { echoCancellation: true, noiseSuppression: true }, video: true }
+        : { audio: { echoCancellation: true, noiseSuppression: true }, video: false }
+    );
+    localStreamRef.current = stream;
+    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    return stream;
   };
 
-  // Drain the ICE queue once remoteDescription is in place
-  const drainIce = useCallback(async () => {
+  // ─── ICE drain ──────────────────────────────────────────────────────────────
+  const drainIce = async () => {
     const peer = peerRef.current;
     if (!peer || !remoteReady.current) return;
     while (pendingIce.current.length) {
-      const c = pendingIce.current.shift();
-      try { await peer.addIceCandidate(c); } catch {}
+      try { await peer.addIceCandidate(pendingIce.current.shift()); } catch {}
     }
-  }, []);
+  };
 
+  // ─── cleanup — safe to call multiple times ───────────────────────────────────
   const cleanupCall = useCallback(() => {
+    // Stop camera + mic
     localStreamRef.current?.getTracks().forEach(t => t.stop());
+    localStreamRef.current = null;
+
+    // Detach video elements
     if (localVideoRef.current)  localVideoRef.current.srcObject  = null;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+
+    // Close peer — null handlers FIRST so onconnectionstatechange can't re-trigger
     if (peerRef.current) {
-      peerRef.current.ontrack               = null;
-      peerRef.current.onicecandidate        = null;
+      peerRef.current.ontrack                = null;
+      peerRef.current.onicecandidate         = null;
       peerRef.current.onconnectionstatechange = null;
       peerRef.current.close();
       peerRef.current = null;
     }
-    localStreamRef.current = null;
-    pendingIce.current  = [];
-    remoteReady.current = false;
+
+    pendingIce.current    = [];
+    remoteReady.current   = false;
+    isEndingCall.current  = false;
+    targetUserIdRef.current = null;
   }, []);
 
+  // ─── end call — entry point for both sides ───────────────────────────────────
+  const endCall = useCallback(() => {
+    if (isEndingCall.current) return;   // guard against double-fire
+    isEndingCall.current = true;
+
+    soundPlayer.stopRingtone?.();
+    soundPlayer.play?.('callEnd');
+
+    const targetId = targetUserIdRef.current;
+    if (targetId) getSocket()?.emit('call:end', { targetUserId: targetId });
+
+    cleanupCall();
+    setCallState('ended');
+    setTimeout(() => resetCall(), 2000);
+  }, [cleanupCall, setCallState, resetCall]);
+
+  // ─── create peer ─────────────────────────────────────────────────────────────
   const createPeer = useCallback((stream) => {
-    const socket = getSocket();
-    const peer   = new RTCPeerConnection(ICE_SERVERS);
+    const peer = new RTCPeerConnection(ICE_SERVERS);
 
     stream.getTracks().forEach(t => peer.addTrack(t, stream));
 
     peer.onicecandidate = ({ candidate }) => {
-      if (candidate) socket?.emit('webrtc:ice', { targetUserId, candidate });
+      if (candidate && targetUserIdRef.current) {
+        getSocket()?.emit('webrtc:ice', {
+          targetUserId: targetUserIdRef.current,
+          candidate,
+        });
+      }
     };
 
     peer.ontrack = ({ streams: [remote] }) => {
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remote;
     };
 
+    // Uses ref for endCall to avoid stale closure
     peer.onconnectionstatechange = () => {
-      if (peer.connectionState === 'connected') setCallState('active');
-      if (['disconnected', 'failed', 'closed'].includes(peer.connectionState)) {
-        endCall();
+      const state = peer.connectionState;
+      if (state === 'connected') setCallState('active');
+      if (['disconnected', 'failed', 'closed'].includes(state)) {
+        // Only fire if WE didn't already initiate the close
+        if (!isEndingCall.current) endCall();
       }
     };
 
     peerRef.current = peer;
     return peer;
-  }, [targetUserId, setCallState]);
+  }, [setCallState, endCall]);
 
-  // ── caller: initiate ──────────────────────────────────────────────────────
-  const startCall = useCallback(async (callType) => {
-    const socket = getSocket();
+  // ─── caller: start call ──────────────────────────────────────────────────────
+  const startCall = useCallback(async (targetUserId, callType) => {
+    targetUserIdRef.current = targetUserId;
     setCallType(callType);
     setCallState('calling');
 
-    const stream = await getMedia(callType);
-    localStreamRef.current = stream;
-    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    try {
+      const stream = await getMedia(callType);
+      createPeer(stream);
+      getSocket()?.emit('call:initiate', { targetUserId, callType });
+    } catch (err) {
+      console.error('startCall failed:', err);
+      cleanupCall();
+      setCallState('idle');
+    }
+  }, [createPeer, cleanupCall, setCallType, setCallState]);
 
-    createPeer(stream);
-
-    // Notify callee — offer is sent only after they accept (see call:accepted below)
-    socket?.emit('call:initiate', { targetUserId, callType });
-  }, [targetUserId, createPeer]);
-
-  // ── callee: answer ────────────────────────────────────────────────────────
-  const answerCall = useCallback(async (callType) => {
-    const socket = getSocket();
-    soundPlayer.stopRingtone();
+  // ─── callee: answer call ─────────────────────────────────────────────────────
+  const answerCall = useCallback(async (targetUserId, callType) => {
+    targetUserIdRef.current = targetUserId;
+    soundPlayer.stopRingtone?.();
     setCallType(callType);
     setCallState('connecting');
 
-    const stream = await getMedia(callType);
-    localStreamRef.current = stream;
-    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-
-    createPeer(stream);
-
-    // Tell caller we accepted — they will now send the offer
-    socket?.emit('call:accept', { targetUserId });
-  }, [targetUserId, createPeer]);
-
-  // ── end call ──────────────────────────────────────────────────────────────
-  const endCall = useCallback(() => {
-    soundPlayer.stopRingtone();
-    soundPlayer.play?.('callEnd');
-    getSocket()?.emit('call:end', { targetUserId });
-    cleanupCall();
-    setCallState('ended');
-    setTimeout(() => resetCall(), 2000);
-  }, [targetUserId, cleanupCall, setCallState, resetCall]);
+    try {
+      const stream = await getMedia(callType);
+      createPeer(stream);
+      // Tell caller we accepted — they will send the offer
+      getSocket()?.emit('call:accept', { targetUserId });
+    } catch (err) {
+      console.error('answerCall failed:', err);
+      cleanupCall();
+      setCallState('idle');
+    }
+  }, [createPeer, cleanupCall, setCallType, setCallState]);
 
   const toggleMute = useCallback(() => {
     const track = localStreamRef.current?.getAudioTracks()[0];
@@ -139,84 +170,115 @@ export const useWebRTC = (targetUserId) => {
     if (track) { track.enabled = !track.enabled; setIsCamOff(!track.enabled); }
   }, []);
 
-  // ── FIX 3: all socket listeners self-contained inside the hook ────────────
+  // ─── ALL socket listeners live here ─────────────────────────────────────────
   useEffect(() => {
     const socket = getSocket();
     if (!socket) return;
 
-    // ── CALLER: callee accepted → now create and send the offer ──────────────
-    const onCallAccepted = async ({ from }) => {
+    // ── Incoming call (callee receives) ──────────────────────────────────────
+    const onIncoming = ({ from, conversationId, callType }) => {
+      setRemoteUser(from);
+      setCallType(callType);
+      setCallState('ringing');
+      soundPlayer.startRingtone?.();
+    };
+
+    // ── Caller: callee accepted → create and send offer ──────────────────────
+    const onAccepted = async ({ from }) => {
       const peer = peerRef.current;
       if (!peer) return;
       setCallState('connecting');
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      socket.emit('webrtc:offer', { targetUserId: from, offer });
-    };
-
-    // ── CALLEE: receive offer → answer it ────────────────────────────────────
-    const onOffer = async ({ from, offer }) => {
-      const peer = peerRef.current;
-      if (!peer) return;
-      await peer.setRemoteDescription(new RTCSessionDescription(offer));
-      remoteReady.current = true;       // gate opens
-      await drainIce();                 // flush any queued candidates
-
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      socket.emit('webrtc:answer', { targetUserId: from, answer });
-    };
-
-    // ── CALLER: receive answer ────────────────────────────────────────────────
-    const onAnswer = async ({ answer }) => {
-      const peer = peerRef.current;
-      if (!peer) return;
-      await peer.setRemoteDescription(new RTCSessionDescription(answer));
-      remoteReady.current = true;       // gate opens
-      await drainIce();                 // flush any queued candidates
-    };
-
-    // ── BOTH: receive ICE candidate ───────────────────────────────────────────
-    const onIce = async ({ candidate }) => {
-      if (!candidate) return;
-      const ice = new RTCIceCandidate(candidate);
-      if (!remoteReady.current) {
-        pendingIce.current.push(ice);   // queue until remoteDescription is set
-      } else {
-        try { await peerRef.current?.addIceCandidate(ice); } catch {}
+      try {
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        socket.emit('webrtc:offer', { targetUserId: from, offer });
+      } catch (err) {
+        console.error('createOffer failed:', err);
+        endCall();
       }
     };
 
-    const onCallRejected = () => {
+    // ── Callee: receives offer → creates answer ──────────────────────────────
+    const onOffer = async ({ from, offer }) => {
+      const peer = peerRef.current;
+      if (!peer) return;
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(offer));
+        remoteReady.current = true;
+        await drainIce();
+
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        socket.emit('webrtc:answer', { targetUserId: from, answer });
+      } catch (err) {
+        console.error('handleOffer failed:', err);
+        endCall();
+      }
+    };
+
+    // ── Caller: receives answer ──────────────────────────────────────────────
+    const onAnswer = async ({ answer }) => {
+      const peer = peerRef.current;
+      if (!peer) return;
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(answer));
+        remoteReady.current = true;
+        await drainIce();
+      } catch (err) {
+        console.error('handleAnswer failed:', err);
+        endCall();
+      }
+    };
+
+    // ── Both: ICE candidate exchange ─────────────────────────────────────────
+    const onIce = async ({ candidate }) => {
+      if (!candidate || !peerRef.current) return;
+      const ice = new RTCIceCandidate(candidate);
+      if (!remoteReady.current) {
+        pendingIce.current.push(ice);
+      } else {
+        try { await peerRef.current.addIceCandidate(ice); } catch {}
+      }
+    };
+
+    // ── Both: remote side rejected or ended ─────────────────────────────────
+    const onRejected = () => {
+      soundPlayer.stopRingtone?.();
       cleanupCall();
       setCallState('ended');
       setTimeout(() => resetCall(), 2000);
     };
 
-    const onCallEnded = () => {
+    const onEnded = () => {
+      // The OTHER side ended — clean up locally without emitting call:end back
+      if (isEndingCall.current) return;
+      isEndingCall.current = true;
+      soundPlayer.stopRingtone?.();
+      soundPlayer.play?.('callEnd');
       cleanupCall();
       setCallState('ended');
       setTimeout(() => resetCall(), 2000);
     };
 
-    socket.on('call:accepted',  onCallAccepted);
+    socket.on('call:incoming',  onIncoming);
+    socket.on('call:accepted',  onAccepted);
     socket.on('webrtc:offer',   onOffer);
     socket.on('webrtc:answer',  onAnswer);
     socket.on('webrtc:ice',     onIce);
-    socket.on('call:rejected',  onCallRejected);
-    socket.on('call:ended',     onCallEnded);
+    socket.on('call:rejected',  onRejected);
+    socket.on('call:ended',     onEnded);
 
     return () => {
-      socket.off('call:accepted',  onCallAccepted);
+      socket.off('call:incoming',  onIncoming);
+      socket.off('call:accepted',  onAccepted);
       socket.off('webrtc:offer',   onOffer);
       socket.off('webrtc:answer',  onAnswer);
       socket.off('webrtc:ice',     onIce);
-      socket.off('call:rejected',  onCallRejected);
-      socket.off('call:ended',     onCallEnded);
+      socket.off('call:rejected',  onRejected);
+      socket.off('call:ended',     onEnded);
     };
-  }, [drainIce, cleanupCall, setCallState, resetCall]);
+  }, [createPeer, endCall, cleanupCall, setCallState, setCallType, setRemoteUser, resetCall]);
 
-  // Safety cleanup on unmount
   useEffect(() => () => cleanupCall(), [cleanupCall]);
 
   return {
