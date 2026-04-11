@@ -1,5 +1,6 @@
-import React, { useEffect, useCallback, useRef } from 'react';
+import React, { useEffect, useCallback, useRef, useState } from 'react';
 import { useNavigate }       from 'react-router-dom';
+import { ArrowLeft }         from 'lucide-react';
 import { useAuthStore }      from '../store/authStore';
 import { useChatStore }      from '../store/chatStore';
 import { useCallStore }      from '../store/callStore';
@@ -16,35 +17,28 @@ import { IncomingCall, CallModal } from '../components/call/CallComponents';
 import { Heart } from 'lucide-react';
 
 const Chat = () => {
-  const { user, token }         = useAuthStore();
+  const { user, token }    = useAuthStore();
   const { conversations, setConversations, activeConversationId, setActiveConversation, typingUsers } = useChatStore();
-  const callStore               = useCallStore();
+  const callStore          = useCallStore();
   const { callState, remoteUser, callType } = callStore;
-  const navigate                = useNavigate();
+  const navigate           = useNavigate();
   const { emit, setActiveConvRef } = useSocket();
-  const [replyTo, setReplyTo]   = React.useState(null);
-
-  // Store incoming call data (offer + caller info)
+  const [replyTo,    setReplyTo]    = useState(null);
+  const [sidebarOpen,setSidebarOpen]= useState(false);
   const incomingCallRef = useRef(null);
 
-  // Active conversation
   const activeConv = conversations.find(c => c._id === activeConversationId);
   const otherUser  = activeConv?.participants?.find(p => p._id !== user?._id);
 
-  // WebRTC hook (no target — target passed per-call)
   const webRTC = useWebRTC();
 
-  // Redirect if not logged in
   useEffect(() => { if (!token) navigate('/auth'); }, [token]);
 
   // Load conversations
   useEffect(() => {
     if (!user) return;
     const load = async () => {
-      try {
-        const { data } = await conversationAPI.getAll();
-        setConversations(data);
-      } catch {}
+      try { const { data } = await conversationAPI.getAll(); setConversations(data); } catch {}
     };
     load();
     const handler = () => load();
@@ -52,65 +46,52 @@ const Chat = () => {
     return () => window.removeEventListener('invite-accepted', handler);
   }, [user]);
 
-  // Track active conversation ref for notifications
-  useEffect(() => {
-    setActiveConvRef(activeConversationId);
-  }, [activeConversationId]);
+  useEffect(() => { setActiveConvRef(activeConversationId); }, [activeConversationId]);
 
-  // ── Wire up ALL call socket events here ─────────────────────────────
+  // Wire call socket events
   useEffect(() => {
     if (!token) return;
-
-    // Poll for socket until it connects
     const interval = setInterval(() => {
       const socket = getSocket();
       if (!socket) return;
       clearInterval(interval);
 
-      // ── Incoming call (receiver side) ──
-      socket.on('call:incoming', ({ from, callType, offer, conversationId }) => {
-        incomingCallRef.current = { from, callType, offer, conversationId };
+      socket.on('call:incoming', ({ from, callType, offer }) => {
+        incomingCallRef.current = { from, callType, offer };
         callStore.setRemoteUser(from);
         callStore.setCallType(callType);
         callStore.setCallState('ringing');
       });
 
-      // ── Caller: receiver accepted, got their answer ──
-      socket.on('call:accepted', ({ from, answer }) => {
+      socket.on('call:accepted', ({ answer }) => {
         webRTC.handleAnswer(answer);
-        // callState moves to 'connecting' → 'active' via onconnectionstatechange
       });
 
-      // ── Caller: receiver rejected ──
       socket.on('call:rejected', () => {
-        webRTC.endCall(false); // don't re-emit end
+        webRTC.endCall(false);
         callStore.resetCall();
       });
 
-      // ── Either side: other person ended the call ──
       socket.on('call:ended', () => {
-        webRTC.endCall(false); // stop media, don't re-emit
+        webRTC.endCall(false);
         callStore.setCallState('ended');
         setTimeout(() => callStore.resetCall(), 2000);
       });
 
-      // ── ICE candidates ──
       socket.on('webrtc:ice', ({ candidate }) => {
         webRTC.handleIce(candidate);
       });
     }, 200);
-
     return () => clearInterval(interval);
   }, [token]);
 
-  // ── Conversation selection ───────────────────────────────────────────
   const handleSelectConversation = useCallback((conv) => {
     setActiveConversation(conv._id);
+    setReplyTo(null);
     const exists = useChatStore.getState().conversations.find(c => c._id === conv._id);
     if (!exists) setConversations([conv, ...useChatStore.getState().conversations]);
   }, []);
 
-  // ── Start calls ──────────────────────────────────────────────────────
   const handleVoiceCall = () => {
     if (!otherUser) return;
     callStore.setRemoteUser(otherUser);
@@ -123,14 +104,12 @@ const Chat = () => {
     webRTC.startCall(otherUser._id, 'video');
   };
 
-  // ── Answer incoming call ─────────────────────────────────────────────
   const handleAnswerCall = () => {
     const { from, callType, offer } = incomingCallRef.current || {};
     if (!from || !offer) return;
     webRTC.answerCall(from._id, callType, offer);
   };
 
-  // ── Reject incoming call ─────────────────────────────────────────────
   const handleRejectCall = () => {
     const { from } = incomingCallRef.current || {};
     if (from) getSocket()?.emit('call:reject', { targetUserId: from._id });
@@ -138,37 +117,60 @@ const Chat = () => {
     callStore.resetCall();
   };
 
-  // ── End active/outgoing call (button) ────────────────────────────────
-  const handleEndCall = () => {
-    webRTC.endCall(true); // stops media + notifies other side
-  };
-
+  const handleEndCall = () => webRTC.endCall(true);
   const isTyping = typingUsers[activeConversationId];
 
-  return (
-    <div style={{ display:'flex', flexDirection:'column', height:'100vh', background:'var(--bg-base)', overflow:'hidden' }}>
-      <Navbar />
+  // On mobile: show chat panel when conversation selected
+  const showChat = !!activeConv;
 
-      <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
+  return (
+    <div style={{ display:'flex', flexDirection:'column', height:'100dvh', background:'var(--bg-base)', overflow:'hidden' }}>
+      <Navbar
+        onMenuToggle={() => setSidebarOpen(o => !o)}
+        showMenu={sidebarOpen}
+      />
+
+      <div style={{ display:'flex', flex:1, overflow:'hidden', position:'relative' }}>
+        {/* Sidebar */}
         <Sidebar
           onSelectConversation={handleSelectConversation}
           activeConversationId={activeConversationId}
+          isOpen={sidebarOpen}
+          onClose={() => setSidebarOpen(false)}
         />
 
-        <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        {/* Chat area */}
+        <div
+          className="chat-panel"
+          style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minWidth:0 }}
+        >
           {activeConv && otherUser ? (
             <>
-              <ChatHeader
-                otherUser={otherUser}
-                onVoiceCall={handleVoiceCall}
-                onVideoCall={handleVideoCall}
-              />
+              {/* Mobile back button inside header row */}
+              <div style={{ display:'flex', alignItems:'center', background:'var(--bg-surface)', borderBottom:'1px solid var(--border)', flexShrink:0 }}>
+                <button
+                  className="mobile-back-btn"
+                  onClick={() => { setActiveConversation(null); setSidebarOpen(false); }}
+                  style={{ background:'none', border:'none', color:'var(--text-secondary)', cursor:'pointer', padding:'0 4px 0 12px', height:64, display:'flex', alignItems:'center' }}
+                >
+                  <ArrowLeft size={20}/>
+                </button>
+                <div style={{ flex:1 }}>
+                  <ChatHeader
+                    otherUser={otherUser}
+                    onVoiceCall={handleVoiceCall}
+                    onVideoCall={handleVideoCall}
+                    noBorder
+                  />
+                </div>
+              </div>
+
               <MessageList
                 conversationId={activeConversationId}
                 otherUser={otherUser}
                 onReply={(msg) => setReplyTo(msg)}
               />
-              <TypingIndicator isTyping={isTyping} displayName={otherUser?.displayName} />
+              <TypingIndicator isTyping={isTyping} displayName={otherUser?.displayName}/>
               <InputBar
                 conversationId={activeConversationId}
                 emit={emit}
@@ -177,18 +179,19 @@ const Chat = () => {
               />
             </>
           ) : (
+            /* Empty state — desktop only (mobile shows sidebar) */
             <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:16, padding:40 }}>
               <div style={{ position:'relative' }}>
-                <div style={{ width:100, height:100, borderRadius:'50%', background:'var(--accent-soft)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:44 }}>
+                <div style={{ width:90, height:90, borderRadius:'50%', background:'var(--accent-soft)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:40 }}>
                   💕
                 </div>
-                <div style={{ position:'absolute', bottom:0, right:0, width:32, height:32, background:'var(--accent)', borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center' }}>
-                  <Heart size={16} color="#fff" />
+                <div style={{ position:'absolute', bottom:0, right:0, width:28, height:28, background:'var(--accent)', borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                  <Heart size={14} color="#fff"/>
                 </div>
               </div>
-              <h2 style={{ color:'var(--text-primary)', fontWeight:700, fontSize:22 }}>JustUs</h2>
-              <p style={{ color:'var(--text-secondary)', fontSize:15, textAlign:'center', maxWidth:360, lineHeight:1.7 }}>
-                Select a conversation from the sidebar or start chatting 💕
+              <h2 style={{ color:'var(--text-primary)', fontWeight:700, fontSize:20 }}>JustUs</h2>
+              <p style={{ color:'var(--text-secondary)', fontSize:14, textAlign:'center', maxWidth:320, lineHeight:1.7 }}>
+                Select a conversation to start chatting 💕
               </p>
             </div>
           )}
@@ -196,8 +199,8 @@ const Chat = () => {
       </div>
 
       {/* Call overlays */}
-      <IncomingCall onAnswer={handleAnswerCall} onReject={handleRejectCall} />
-      <CallModal webRTC={{ ...webRTC, endCall: handleEndCall }} />
+      <IncomingCall onAnswer={handleAnswerCall} onReject={handleRejectCall}/>
+      <CallModal webRTC={{ ...webRTC, endCall: handleEndCall }}/>
     </div>
   );
 };

@@ -3,15 +3,15 @@ import { Phone, Video } from 'lucide-react';
 import Avatar from '../common/Avatar';
 import { formatLastSeen } from '../../utils/formatTime';
 
-const ChatHeader = ({ otherUser, onVoiceCall, onVideoCall }) => {
+const ChatHeader = ({ otherUser, onVoiceCall, onVideoCall, noBorder }) => {
   if (!otherUser) return null;
 
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      padding: '0 20px', height: 64, flexShrink: 0,
-      background: 'var(--bg-surface)',
-      borderBottom: '1px solid var(--border)',
+      display:'flex', alignItems:'center', justifyContent:'space-between',
+      padding:'0 16px', height:64, flexShrink:0,
+      background:'var(--bg-surface)',
+      borderBottom: noBorder ? 'none' : '1px solid var(--border)',
     }}>
       <div style={{ display:'flex', alignItems:'center', gap:12 }}>
         <Avatar user={otherUser} size={42} />

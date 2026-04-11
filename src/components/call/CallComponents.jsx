@@ -82,7 +82,7 @@ export const IncomingCall = ({ onAnswer, onReject }) => {
   if (callState !== 'ringing') return null;
 
   return (
-    <div className="fade-in" style={{
+    <div className="fade-in incoming-call-popup" style={{
       position:'fixed', top:20, right:20,
       background:'var(--bg-elevated)',
       border:'1px solid var(--border-strong)',
