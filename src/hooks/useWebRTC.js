@@ -1,288 +1,233 @@
-// hooks/useWebRTC.js
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback } from 'react';
 import { getSocket }    from './useSocket';
-import { soundPlayer }  from '../utils/soundPlayer';
 import { useCallStore } from '../store/callStore';
 
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-  ],
+    // For strict NAT — uncomment:
+    // { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' }
+  ]
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// useWebRTC — correct WebRTC signaling flow:
+//
+//  CALLER:  getMedia → createPeer → addTracks → createOffer → setLocal
+//           → emit call:initiate (offer inside)
+//
+//  CALLEE:  receives call:incoming (offer inside) → user clicks Accept
+//           → getMedia → createPeer → addTracks → setRemote(offer)
+//           → createAnswer → setLocal → emit call:accept (answer inside)
+//
+//  CALLER:  receives call:accepted (answer inside)
+//           → setRemote(answer)
+//           → ICE candidates flow both ways → connected!
+// ─────────────────────────────────────────────────────────────────────────────
 export const useWebRTC = () => {
-  const peerRef          = useRef(null);
-  const localStreamRef   = useRef(null);
-  const localVideoRef    = useRef(null);
-  const remoteVideoRef   = useRef(null);
-  const pendingIce       = useRef([]);
-  const remoteReady      = useRef(false);
-  const isEndingCall     = useRef(false);   // prevents double-fire from peer.close()
-  const targetUserIdRef  = useRef(null);    // mutable — avoids stale closures
+  const peerRef        = useRef(null);
+  const localStreamRef = useRef(null);
+  const localVideoRef  = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const remoteUserIdRef = useRef(null);
 
   const [isMuted,  setIsMuted]  = useState(false);
   const [isCamOff, setIsCamOff] = useState(false);
 
-  const {
-    setCallState, setCallType, setRemoteUser,
-    setIncomingOffer, resetCall,
-  } = useCallStore();
+  const { setCallState, setCallType, resetCall } = useCallStore();
 
-  // ─── media ──────────────────────────────────────────────────────────────────
+  // ── Get user media ────────────────────────────────────────────────────
   const getMedia = async (callType) => {
-    const stream = await navigator.mediaDevices.getUserMedia(
-      callType === 'video'
-        ? { audio: { echoCancellation: true, noiseSuppression: true }, video: true }
-        : { audio: { echoCancellation: true, noiseSuppression: true }, video: false }
-    );
-    localStreamRef.current = stream;
-    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-    return stream;
+    const constraints = callType === 'video'
+      ? { audio: { echoCancellation: true, noiseSuppression: true }, video: { facingMode: 'user' } }
+      : { audio: { echoCancellation: true, noiseSuppression: true }, video: false };
+    return await navigator.mediaDevices.getUserMedia(constraints);
   };
 
-  // ─── ICE drain ──────────────────────────────────────────────────────────────
-  const drainIce = async () => {
-    const peer = peerRef.current;
-    if (!peer || !remoteReady.current) return;
-    while (pendingIce.current.length) {
-      try { await peer.addIceCandidate(pendingIce.current.shift()); } catch {}
-    }
-  };
-
-  // ─── cleanup — safe to call multiple times ───────────────────────────────────
-  const cleanupCall = useCallback(() => {
-    // Stop camera + mic
-    localStreamRef.current?.getTracks().forEach(t => t.stop());
-    localStreamRef.current = null;
-
-    // Detach video elements
-    if (localVideoRef.current)  localVideoRef.current.srcObject  = null;
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-
-    // Close peer — null handlers FIRST so onconnectionstatechange can't re-trigger
+  // ── Create RTCPeerConnection ──────────────────────────────────────────
+  const createPeer = useCallback((targetUserId) => {
+    // Close any existing peer first
     if (peerRef.current) {
-      peerRef.current.ontrack                = null;
-      peerRef.current.onicecandidate         = null;
+      peerRef.current.onicecandidate    = null;
+      peerRef.current.ontrack           = null;
       peerRef.current.onconnectionstatechange = null;
       peerRef.current.close();
       peerRef.current = null;
     }
 
-    pendingIce.current    = [];
-    remoteReady.current   = false;
-    isEndingCall.current  = false;
-    targetUserIdRef.current = null;
-  }, []);
-
-  // ─── end call — entry point for both sides ───────────────────────────────────
-  const endCall = useCallback(() => {
-    if (isEndingCall.current) return;   // guard against double-fire
-    isEndingCall.current = true;
-
-    soundPlayer.stopRingtone?.();
-    soundPlayer.play?.('callEnd');
-
-    const targetId = targetUserIdRef.current;
-    if (targetId) getSocket()?.emit('call:end', { targetUserId: targetId });
-
-    cleanupCall();
-    setCallState('ended');
-    setTimeout(() => resetCall(), 2000);
-  }, [cleanupCall, setCallState, resetCall]);
-
-  // ─── create peer ─────────────────────────────────────────────────────────────
-  const createPeer = useCallback((stream) => {
     const peer = new RTCPeerConnection(ICE_SERVERS);
-
-    stream.getTracks().forEach(t => peer.addTrack(t, stream));
+    remoteUserIdRef.current = targetUserId;
 
     peer.onicecandidate = ({ candidate }) => {
-      if (candidate && targetUserIdRef.current) {
-        getSocket()?.emit('webrtc:ice', {
-          targetUserId: targetUserIdRef.current,
-          candidate,
-        });
+      if (candidate && remoteUserIdRef.current) {
+        getSocket()?.emit('webrtc:ice', { targetUserId: remoteUserIdRef.current, candidate });
       }
     };
 
-    peer.ontrack = ({ streams: [remote] }) => {
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remote;
+    peer.ontrack = (event) => {
+      if (remoteVideoRef.current && event.streams[0]) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+      }
     };
 
-    // Uses ref for endCall to avoid stale closure
     peer.onconnectionstatechange = () => {
-      const state = peer.connectionState;
-      if (state === 'connected') setCallState('active');
-      if (['disconnected', 'failed', 'closed'].includes(state)) {
-        // Only fire if WE didn't already initiate the close
-        if (!isEndingCall.current) endCall();
+      console.log('WebRTC state:', peer.connectionState);
+      if (peer.connectionState === 'connected') {
+        setCallState('active');
+      }
+      if (['disconnected', 'failed', 'closed'].includes(peer.connectionState)) {
+        // Other side dropped — clean up locally without emitting (they already disconnected)
+        cleanupMedia();
+        setCallState('ended');
+        setTimeout(() => resetCall(), 2000);
       }
     };
 
     peerRef.current = peer;
     return peer;
-  }, [setCallState, endCall]);
+  }, []);
 
-  // ─── caller: start call ──────────────────────────────────────────────────────
+  // ── Cleanup all media and peer ────────────────────────────────────────
+  const cleanupMedia = useCallback(() => {
+    localStreamRef.current?.getTracks().forEach(t => {
+      t.stop(); // RELEASES mic and camera hardware
+    });
+    localStreamRef.current = null;
+
+    if (peerRef.current) {
+      peerRef.current.onicecandidate    = null;
+      peerRef.current.ontrack           = null;
+      peerRef.current.onconnectionstatechange = null;
+      peerRef.current.close();
+      peerRef.current = null;
+    }
+
+    if (localVideoRef.current)  localVideoRef.current.srcObject  = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+
+    remoteUserIdRef.current = null;
+    setIsMuted(false);
+    setIsCamOff(false);
+  }, []);
+
+  // ── CALLER: start call ────────────────────────────────────────────────
+  // Gets media, creates peer, creates offer, sends call:initiate WITH offer
   const startCall = useCallback(async (targetUserId, callType) => {
-    targetUserIdRef.current = targetUserId;
-    setCallType(callType);
-    setCallState('calling');
-
     try {
+      setCallType(callType);
+      setCallState('calling');
+
       const stream = await getMedia(callType);
-      createPeer(stream);
-      getSocket()?.emit('call:initiate', { targetUserId, callType });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
+      const peer = createPeer(targetUserId);
+      stream.getTracks().forEach(t => peer.addTrack(t, stream));
+
+      // Create offer BEFORE notifying the other side
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+
+      // Send call:initiate WITH the WebRTC offer included
+      getSocket()?.emit('call:initiate', {
+        targetUserId,
+        callType,
+        offer: peer.localDescription,
+      });
+
     } catch (err) {
-      console.error('startCall failed:', err);
-      cleanupCall();
-      setCallState('idle');
+      console.error('startCall error:', err);
+      cleanupMedia();
+      resetCall();
     }
-  }, [createPeer, cleanupCall, setCallType, setCallState]);
+  }, [createPeer, cleanupMedia]);
 
-  // ─── callee: answer call ─────────────────────────────────────────────────────
-  const answerCall = useCallback(async (targetUserId, callType) => {
-    targetUserIdRef.current = targetUserId;
-    soundPlayer.stopRingtone?.();
-    setCallType(callType);
-    setCallState('connecting');
-
+  // ── CALLEE: accept incoming call ──────────────────────────────────────
+  // Gets media, sets remote offer, creates answer, sends call:accept WITH answer
+  const answerCall = useCallback(async (targetUserId, callType, offer) => {
     try {
-      const stream = await getMedia(callType);
-      createPeer(stream);
-      // Tell caller we accepted — they will send the offer
-      getSocket()?.emit('call:accept', { targetUserId });
-    } catch (err) {
-      console.error('answerCall failed:', err);
-      cleanupCall();
-      setCallState('idle');
-    }
-  }, [createPeer, cleanupCall, setCallType, setCallState]);
+      setCallType(callType);
+      setCallState('connecting');
 
+      const stream = await getMedia(callType);
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
+      const peer = createPeer(targetUserId);
+      stream.getTracks().forEach(t => peer.addTrack(t, stream));
+
+      // Set caller's offer as remote description
+      await peer.setRemoteDescription(new RTCSessionDescription(offer));
+
+      // Create answer
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+
+      // Send accept WITH the WebRTC answer
+      getSocket()?.emit('call:accept', {
+        targetUserId,
+        answer: peer.localDescription,
+      });
+
+    } catch (err) {
+      console.error('answerCall error:', err);
+      cleanupMedia();
+      resetCall();
+    }
+  }, [createPeer, cleanupMedia]);
+
+  // ── CALLER: receives answer from callee ───────────────────────────────
+  const handleAnswer = useCallback(async (answer) => {
+    try {
+      if (!peerRef.current) return;
+      setCallState('connecting');
+      await peerRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (err) {
+      console.error('handleAnswer error:', err);
+    }
+  }, []);
+
+  // ── Both: handle ICE candidates ───────────────────────────────────────
+  const handleIce = useCallback(async (candidate) => {
+    try {
+      if (peerRef.current && peerRef.current.remoteDescription) {
+        await peerRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    } catch {}
+  }, []);
+
+  // ── End call — called by button OR when other side hangs up ──────────
+  const endCall = useCallback((notifyOther = true) => {
+    const targetId = remoteUserIdRef.current;
+
+    // Stop all tracks — releases mic and camera indicators
+    cleanupMedia();
+
+    // Notify the other person (unless they already hung up)
+    if (notifyOther && targetId) {
+      getSocket()?.emit('call:end', { targetUserId: targetId });
+    }
+
+    setCallState('ended');
+    setTimeout(() => resetCall(), 2000);
+  }, [cleanupMedia, resetCall]);
+
+  // ── Toggle mute ───────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
     const track = localStreamRef.current?.getAudioTracks()[0];
     if (track) { track.enabled = !track.enabled; setIsMuted(!track.enabled); }
   }, []);
 
+  // ── Toggle camera ─────────────────────────────────────────────────────
   const toggleCamera = useCallback(() => {
     const track = localStreamRef.current?.getVideoTracks()[0];
     if (track) { track.enabled = !track.enabled; setIsCamOff(!track.enabled); }
   }, []);
 
-  // ─── ALL socket listeners live here ─────────────────────────────────────────
-  useEffect(() => {
-    const socket = getSocket();
-    if (!socket) return;
-
-    // ── Incoming call (callee receives) ──────────────────────────────────────
-    const onIncoming = ({ from, conversationId, callType }) => {
-      setRemoteUser(from);
-      setCallType(callType);
-      setCallState('ringing');
-      soundPlayer.startRingtone?.();
-    };
-
-    // ── Caller: callee accepted → create and send offer ──────────────────────
-    const onAccepted = async ({ from }) => {
-      const peer = peerRef.current;
-      if (!peer) return;
-      setCallState('connecting');
-      try {
-        const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
-        socket.emit('webrtc:offer', { targetUserId: from, offer });
-      } catch (err) {
-        console.error('createOffer failed:', err);
-        endCall();
-      }
-    };
-
-    // ── Callee: receives offer → creates answer ──────────────────────────────
-    const onOffer = async ({ from, offer }) => {
-      const peer = peerRef.current;
-      if (!peer) return;
-      try {
-        await peer.setRemoteDescription(new RTCSessionDescription(offer));
-        remoteReady.current = true;
-        await drainIce();
-
-        const answer = await peer.createAnswer();
-        await peer.setLocalDescription(answer);
-        socket.emit('webrtc:answer', { targetUserId: from, answer });
-      } catch (err) {
-        console.error('handleOffer failed:', err);
-        endCall();
-      }
-    };
-
-    // ── Caller: receives answer ──────────────────────────────────────────────
-    const onAnswer = async ({ answer }) => {
-      const peer = peerRef.current;
-      if (!peer) return;
-      try {
-        await peer.setRemoteDescription(new RTCSessionDescription(answer));
-        remoteReady.current = true;
-        await drainIce();
-      } catch (err) {
-        console.error('handleAnswer failed:', err);
-        endCall();
-      }
-    };
-
-    // ── Both: ICE candidate exchange ─────────────────────────────────────────
-    const onIce = async ({ candidate }) => {
-      if (!candidate || !peerRef.current) return;
-      const ice = new RTCIceCandidate(candidate);
-      if (!remoteReady.current) {
-        pendingIce.current.push(ice);
-      } else {
-        try { await peerRef.current.addIceCandidate(ice); } catch {}
-      }
-    };
-
-    // ── Both: remote side rejected or ended ─────────────────────────────────
-    const onRejected = () => {
-      soundPlayer.stopRingtone?.();
-      cleanupCall();
-      setCallState('ended');
-      setTimeout(() => resetCall(), 2000);
-    };
-
-    const onEnded = () => {
-      // The OTHER side ended — clean up locally without emitting call:end back
-      if (isEndingCall.current) return;
-      isEndingCall.current = true;
-      soundPlayer.stopRingtone?.();
-      soundPlayer.play?.('callEnd');
-      cleanupCall();
-      setCallState('ended');
-      setTimeout(() => resetCall(), 2000);
-    };
-
-    socket.on('call:incoming',  onIncoming);
-    socket.on('call:accepted',  onAccepted);
-    socket.on('webrtc:offer',   onOffer);
-    socket.on('webrtc:answer',  onAnswer);
-    socket.on('webrtc:ice',     onIce);
-    socket.on('call:rejected',  onRejected);
-    socket.on('call:ended',     onEnded);
-
-    return () => {
-      socket.off('call:incoming',  onIncoming);
-      socket.off('call:accepted',  onAccepted);
-      socket.off('webrtc:offer',   onOffer);
-      socket.off('webrtc:answer',  onAnswer);
-      socket.off('webrtc:ice',     onIce);
-      socket.off('call:rejected',  onRejected);
-      socket.off('call:ended',     onEnded);
-    };
-  }, [createPeer, endCall, cleanupCall, setCallState, setCallType, setRemoteUser, resetCall]);
-
-  useEffect(() => () => cleanupCall(), [cleanupCall]);
-
   return {
     startCall, answerCall, endCall,
+    handleAnswer, handleIce,
     toggleMute, toggleCamera,
     isMuted, isCamOff,
     localVideoRef, remoteVideoRef,

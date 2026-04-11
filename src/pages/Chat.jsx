@@ -1,9 +1,9 @@
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect, useCallback, useRef } from 'react';
 import { useNavigate }       from 'react-router-dom';
 import { useAuthStore }      from '../store/authStore';
 import { useChatStore }      from '../store/chatStore';
 import { useCallStore }      from '../store/callStore';
-import { useSocket }         from '../hooks/useSocket';
+import { useSocket, getSocket } from '../hooks/useSocket';
 import { useWebRTC }         from '../hooks/useWebRTC';
 import { conversationAPI }   from '../services/api';
 import Navbar                from '../components/common/Navbar';
@@ -18,16 +18,21 @@ import { Heart } from 'lucide-react';
 const Chat = () => {
   const { user, token }         = useAuthStore();
   const { conversations, setConversations, activeConversationId, setActiveConversation, typingUsers } = useChatStore();
-  const { callState, remoteUser, callType, incomingOffer, setCallState } = useCallStore();
+  const callStore               = useCallStore();
+  const { callState, remoteUser, callType } = callStore;
   const navigate                = useNavigate();
   const { emit, setActiveConvRef } = useSocket();
+  const [replyTo, setReplyTo]   = React.useState(null);
 
-  // Active conversation object
-  const activeConv  = conversations.find(c => c._id === activeConversationId);
-  const otherUser   = activeConv?.participants?.find(p => p._id !== user?._id);
+  // Store incoming call data (offer + caller info)
+  const incomingCallRef = useRef(null);
 
-  // WebRTC — target is the other person in the active conversation
-  const webRTC = useWebRTC(otherUser?._id);
+  // Active conversation
+  const activeConv = conversations.find(c => c._id === activeConversationId);
+  const otherUser  = activeConv?.participants?.find(p => p._id !== user?._id);
+
+  // WebRTC hook (no target — target passed per-call)
+  const webRTC = useWebRTC();
 
   // Redirect if not logged in
   useEffect(() => { if (!token) navigate('/auth'); }, [token]);
@@ -36,65 +41,109 @@ const Chat = () => {
   useEffect(() => {
     if (!user) return;
     const load = async () => {
-      const { data } = await conversationAPI.getAll();
-      setConversations(data);
+      try {
+        const { data } = await conversationAPI.getAll();
+        setConversations(data);
+      } catch {}
     };
     load();
-
-    // Re-load when invite accepted
     const handler = () => load();
     window.addEventListener('invite-accepted', handler);
     return () => window.removeEventListener('invite-accepted', handler);
   }, [user]);
 
-  // Track active conversation for socket/notifications
+  // Track active conversation ref for notifications
   useEffect(() => {
     setActiveConvRef(activeConversationId);
   }, [activeConversationId]);
 
+  // ── Wire up ALL call socket events here ─────────────────────────────
+  useEffect(() => {
+    if (!token) return;
+
+    // Poll for socket until it connects
+    const interval = setInterval(() => {
+      const socket = getSocket();
+      if (!socket) return;
+      clearInterval(interval);
+
+      // ── Incoming call (receiver side) ──
+      socket.on('call:incoming', ({ from, callType, offer, conversationId }) => {
+        incomingCallRef.current = { from, callType, offer, conversationId };
+        callStore.setRemoteUser(from);
+        callStore.setCallType(callType);
+        callStore.setCallState('ringing');
+      });
+
+      // ── Caller: receiver accepted, got their answer ──
+      socket.on('call:accepted', ({ from, answer }) => {
+        webRTC.handleAnswer(answer);
+        // callState moves to 'connecting' → 'active' via onconnectionstatechange
+      });
+
+      // ── Caller: receiver rejected ──
+      socket.on('call:rejected', () => {
+        webRTC.endCall(false); // don't re-emit end
+        callStore.resetCall();
+      });
+
+      // ── Either side: other person ended the call ──
+      socket.on('call:ended', () => {
+        webRTC.endCall(false); // stop media, don't re-emit
+        callStore.setCallState('ended');
+        setTimeout(() => callStore.resetCall(), 2000);
+      });
+
+      // ── ICE candidates ──
+      socket.on('webrtc:ice', ({ candidate }) => {
+        webRTC.handleIce(candidate);
+      });
+    }, 200);
+
+    return () => clearInterval(interval);
+  }, [token]);
+
+  // ── Conversation selection ───────────────────────────────────────────
   const handleSelectConversation = useCallback((conv) => {
     setActiveConversation(conv._id);
-    // Make sure this conversation is in the store
     const exists = useChatStore.getState().conversations.find(c => c._id === conv._id);
-    if (!exists) {
-      setConversations([conv, ...useChatStore.getState().conversations]);
-    }
+    if (!exists) setConversations([conv, ...useChatStore.getState().conversations]);
   }, []);
 
-  // Call handlers
+  // ── Start calls ──────────────────────────────────────────────────────
   const handleVoiceCall = () => {
     if (!otherUser) return;
-    webRTC.startCall('audio');
-    useCallStore.getState().setRemoteUser(otherUser);
-    useCallStore.getState().setCallType('audio');
-    useCallStore.getState().setCallState('calling');
-    emit('call:initiate', { targetUserId: otherUser._id, conversationId: activeConversationId, callType: 'audio' });
+    callStore.setRemoteUser(otherUser);
+    webRTC.startCall(otherUser._id, 'audio');
   };
 
   const handleVideoCall = () => {
     if (!otherUser) return;
-    webRTC.startCall('video');
-    useCallStore.getState().setRemoteUser(otherUser);
-    useCallStore.getState().setCallType('video');
-    useCallStore.getState().setCallState('calling');
-    emit('call:initiate', { targetUserId: otherUser._id, conversationId: activeConversationId, callType: 'video' });
+    callStore.setRemoteUser(otherUser);
+    webRTC.startCall(otherUser._id, 'video');
   };
 
-  const handleAnswerCall = () => webRTC.answerCall(callType, incomingOffer);
+  // ── Answer incoming call ─────────────────────────────────────────────
+  const handleAnswerCall = () => {
+    const { from, callType, offer } = incomingCallRef.current || {};
+    if (!from || !offer) return;
+    webRTC.answerCall(from._id, callType, offer);
+  };
 
+  // ── Reject incoming call ─────────────────────────────────────────────
   const handleRejectCall = () => {
-    emit('call:reject', { targetUserId: remoteUser?._id });
-    useCallStore.getState().resetCall();
+    const { from } = incomingCallRef.current || {};
+    if (from) getSocket()?.emit('call:reject', { targetUserId: from._id });
+    incomingCallRef.current = null;
+    callStore.resetCall();
   };
 
-  // Listen for WebRTC events on socket
-  useEffect(() => {
-    const { socket } = { socket: null }; // handled via getSocket in useWebRTC
-    // These are wired in useSocket → useWebRTC via getSocket()
-  }, []);
+  // ── End active/outgoing call (button) ────────────────────────────────
+  const handleEndCall = () => {
+    webRTC.endCall(true); // stops media + notifies other side
+  };
 
   const isTyping = typingUsers[activeConversationId];
-  const [replyTo, setReplyTo] = React.useState(null);
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'100vh', background:'var(--bg-base)', overflow:'hidden' }}>
@@ -106,7 +155,6 @@ const Chat = () => {
           activeConversationId={activeConversationId}
         />
 
-        {/* Main chat area */}
         <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
           {activeConv && otherUser ? (
             <>
@@ -120,10 +168,7 @@ const Chat = () => {
                 otherUser={otherUser}
                 onReply={(msg) => setReplyTo(msg)}
               />
-              <TypingIndicator
-                isTyping={isTyping}
-                displayName={otherUser?.displayName}
-              />
+              <TypingIndicator isTyping={isTyping} displayName={otherUser?.displayName} />
               <InputBar
                 conversationId={activeConversationId}
                 emit={emit}
@@ -143,7 +188,7 @@ const Chat = () => {
               </div>
               <h2 style={{ color:'var(--text-primary)', fontWeight:700, fontSize:22 }}>JustUs</h2>
               <p style={{ color:'var(--text-secondary)', fontSize:15, textAlign:'center', maxWidth:360, lineHeight:1.7 }}>
-                Select a conversation from the sidebar or search for someone to start chatting 💕
+                Select a conversation from the sidebar or start chatting 💕
               </p>
             </div>
           )}
@@ -152,7 +197,7 @@ const Chat = () => {
 
       {/* Call overlays */}
       <IncomingCall onAnswer={handleAnswerCall} onReject={handleRejectCall} />
-      <CallModal webRTC={webRTC} />
+      <CallModal webRTC={{ ...webRTC, endCall: handleEndCall }} />
     </div>
   );
 };
