@@ -1,24 +1,17 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { useAuthStore }  from '../store/authStore';
-import { useChatStore }  from '../store/chatStore';
-import { useCallStore }  from '../store/callStore';
-import { soundPlayer }   from '../utils/soundPlayer';
+import { useAuthStore }    from '../store/authStore';
+import { useChatStore }    from '../store/chatStore';
+import { soundPlayer }     from '../utils/soundPlayer';
 import { useNotification } from './useNotification';
 
 let socketInstance = null;
 
 export const useSocket = () => {
-  const { token, user }        = useAuthStore();
-  const {
-    addMessage, updateMessage, updateConversation,
-    setTyping, updateUserStatus, conversations
-  } = useChatStore();
-  const { setCallState, setCallType, setRemoteUser, setIncomingOffer, setConversationId } = useCallStore();
-  const { showNotification }   = useNotification();
-  const activeConvIdRef        = useRef(null);
-
-  // keep activeConvId in sync
+  const { token }      = useAuthStore();
+  const { addMessage, updateMessage, updateConversation, setTyping, updateUserStatus } = useChatStore();
+  const { showNotification } = useNotification();
+  const activeConvIdRef = useRef(null);
   const setActiveConvRef = useCallback((id) => { activeConvIdRef.current = id; }, []);
 
   useEffect(() => {
@@ -26,10 +19,15 @@ export const useSocket = () => {
 
     socketInstance = io(import.meta.env.VITE_SOCKET_URL, {
       auth: { token },
-      transports: ['websocket'],
+      transports: ['websocket', 'polling'], // polling fallback for mobile
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
     });
 
+    socketInstance.on('connect', () => console.log('[Socket] connected'));
     socketInstance.on('connect_error', (err) => {
+      console.warn('[Socket] connect_error:', err.message);
       if (err.message === 'Invalid token' || err.message === 'No token') {
         useAuthStore.getState().clearAuth();
         window.location.href = '/auth';
@@ -40,14 +38,10 @@ export const useSocket = () => {
     socketInstance.on('message:received', (msg) => {
       const convId = msg.conversationId?._id || msg.conversationId;
       addMessage(convId, msg);
-
-      // Update conversation preview
       updateConversation(convId, { lastMessage: msg, lastActivity: new Date() });
-
-      // Notify if not focused / not in this conversation
       if (convId !== activeConvIdRef.current || !document.hasFocus()) {
         soundPlayer.play('message');
-        const sender = msg.senderId?.displayName || 'New message';
+        const sender  = msg.senderId?.displayName || 'New message';
         const preview = msg.type === 'text' ? msg.content : `📎 ${msg.type}`;
         showNotification(`💕 ${sender}`, preview, msg.senderId?.avatar);
       }
@@ -76,7 +70,7 @@ export const useSocket = () => {
     socketInstance.on('typing:started', ({ conversationId }) => setTyping(conversationId, true));
     socketInstance.on('typing:stopped', ({ conversationId }) => setTyping(conversationId, false));
 
-    // ── Read receipts ───────────────────────────────────────────────────
+    // ── Read receipts ────────────────────────────────────────────────────
     socketInstance.on('messages:read', ({ conversationId, readBy }) => {
       const { messages } = useChatStore.getState();
       (messages[conversationId] || []).forEach(m => {
@@ -86,38 +80,17 @@ export const useSocket = () => {
       });
     });
 
-    // ── Presence ────────────────────────────────────────────────────────
-    socketInstance.on('user:online',  ({ userId, lastSeen }) =>
-      updateUserStatus(userId, { isOnline: true, lastSeen }));
-    socketInstance.on('user:offline', ({ userId, lastSeen }) =>
-      updateUserStatus(userId, { isOnline: false, lastSeen }));
+    // ── Presence ─────────────────────────────────────────────────────────
+    socketInstance.on('user:online',  ({ userId, lastSeen }) => updateUserStatus(userId, { isOnline: true, lastSeen }));
+    socketInstance.on('user:offline', ({ userId, lastSeen }) => updateUserStatus(userId, { isOnline: false, lastSeen }));
 
-    // ── Calls ───────────────────────────────────────────────────────────
-    socketInstance.on('call:incoming', ({ from, callType, conversationId }) => {
-      soundPlayer.play('ringtone');
-      setRemoteUser(from);
-      setCallType(callType);
-      setCallState('ringing');
-      setConversationId(conversationId);
-    });
-
-    socketInstance.on('call:accepted', () => setCallState('connecting'));
-    socketInstance.on('call:rejected', () => {
-      soundPlayer.stopRingtone();
-      setCallState('idle');
-    });
-    socketInstance.on('call:ended', () => {
-      soundPlayer.stopRingtone();
-      soundPlayer.play('callEnd');
-      setCallState('ended');
-      setTimeout(() => useCallStore.getState().resetCall(), 2000);
-    });
-
-    // ── Invite accepted ─────────────────────────────────────────────────
+    // ── Invite ───────────────────────────────────────────────────────────
     socketInstance.on('invite:accepted', ({ by, conversationId }) => {
-      // Reload conversations so the new one appears
       window.dispatchEvent(new CustomEvent('invite-accepted', { detail: { by, conversationId } }));
     });
+
+    // NOTE: call:* and webrtc:* events are handled ONLY in Chat.jsx
+    // to avoid duplicate handlers corrupting the WebRTC signaling flow.
 
     return () => {
       socketInstance?.disconnect();
@@ -125,11 +98,8 @@ export const useSocket = () => {
     };
   }, [token]);
 
-  const emit = useCallback((event, data) => {
-    socketInstance?.emit(event, data);
-  }, []);
-
-  return { socket: socketInstance, emit, setActiveConvRef };
+  const emit = useCallback((event, data) => socketInstance?.emit(event, data), []);
+  return { emit, setActiveConvRef };
 };
 
 export const getSocket = () => socketInstance;

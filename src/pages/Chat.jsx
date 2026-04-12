@@ -20,13 +20,17 @@ const Chat = () => {
   const { user, token }    = useAuthStore();
   const { conversations, setConversations, activeConversationId, setActiveConversation, typingUsers } = useChatStore();
   const callStore          = useCallStore();
-  const { callState, remoteUser, callType } = callStore;
   const navigate           = useNavigate();
   const { emit, setActiveConvRef } = useSocket();
-  const [replyTo,    setReplyTo]    = useState(null);
-  const [sidebarOpen,setSidebarOpen]= useState(false);
-  const incomingCallRef = useRef(null);
 
+  const [replyTo,     setReplyTo]     = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Incoming call data (offer + caller info) stored in ref — not state
+  // so it doesn't trigger re-renders during sensitive WebRTC setup
+  const incomingRef = useRef(null);
+
+  // Active conversation
   const activeConv = conversations.find(c => c._id === activeConversationId);
   const otherUser  = activeConv?.participants?.find(p => p._id !== user?._id);
 
@@ -34,57 +38,93 @@ const Chat = () => {
 
   useEffect(() => { if (!token) navigate('/auth'); }, [token]);
 
-  // Load conversations
+  // ── Load conversations ─────────────────────────────────────────────
   useEffect(() => {
     if (!user) return;
     const load = async () => {
       try { const { data } = await conversationAPI.getAll(); setConversations(data); } catch {}
     };
     load();
-    const handler = () => load();
-    window.addEventListener('invite-accepted', handler);
-    return () => window.removeEventListener('invite-accepted', handler);
+    const onInvite = () => load();
+    window.addEventListener('invite-accepted', onInvite);
+    return () => window.removeEventListener('invite-accepted', onInvite);
   }, [user]);
 
   useEffect(() => { setActiveConvRef(activeConversationId); }, [activeConversationId]);
 
-  // Wire call socket events
+  // ── Wire ALL call + WebRTC socket events (single place, no duplicates) ─
   useEffect(() => {
     if (!token) return;
-    const interval = setInterval(() => {
-      const socket = getSocket();
-      if (!socket) return;
-      clearInterval(interval);
 
+    // Wait for socket to be ready, then attach handlers once
+    let socket = null;
+    let attempts = 0;
+    const attach = () => {
+      socket = getSocket();
+      if (!socket?.connected) {
+        if (++attempts < 30) { setTimeout(attach, 300); }
+        return;
+      }
+
+      // Remove any stale listeners first
+      socket.off('call:incoming');
+      socket.off('call:accepted');
+      socket.off('call:rejected');
+      socket.off('call:ended');
+      socket.off('webrtc:ice');
+
+      // ── Incoming call (receiver sees this) ──────────────────────────
       socket.on('call:incoming', ({ from, callType, offer }) => {
-        incomingCallRef.current = { from, callType, offer };
+        console.log('[Call] incoming from', from.displayName, 'type:', callType);
+        incomingRef.current = { from, callType, offer };
         callStore.setRemoteUser(from);
         callStore.setCallType(callType);
         callStore.setCallState('ringing');
       });
 
+      // ── Caller: receiver accepted, got their WebRTC answer ──────────
       socket.on('call:accepted', ({ answer }) => {
+        console.log('[Call] accepted — setting remote answer');
         webRTC.handleAnswer(answer);
       });
 
+      // ── Caller: receiver rejected ───────────────────────────────────
       socket.on('call:rejected', () => {
-        webRTC.endCall(false);
+        console.log('[Call] rejected');
+        webRTC.endCall(false);  // stop media without re-emitting
         callStore.resetCall();
       });
 
+      // ── Either side: other person hung up ───────────────────────────
       socket.on('call:ended', () => {
-        webRTC.endCall(false);
+        console.log('[Call] remote ended call');
+        webRTC.endCall(false);  // stop media without re-emitting
         callStore.setCallState('ended');
         setTimeout(() => callStore.resetCall(), 2000);
       });
 
+      // ── ICE candidates ───────────────────────────────────────────────
       socket.on('webrtc:ice', ({ candidate }) => {
         webRTC.handleIce(candidate);
       });
-    }, 200);
-    return () => clearInterval(interval);
-  }, [token]);
+    };
 
+    attach();
+
+    return () => {
+      // Clean up listeners on unmount
+      const s = getSocket();
+      if (s) {
+        s.off('call:incoming');
+        s.off('call:accepted');
+        s.off('call:rejected');
+        s.off('call:ended');
+        s.off('webrtc:ice');
+      }
+    };
+  }, [token]); // only re-attach if token changes (login/logout)
+
+  // ── Conversation selection ─────────────────────────────────────────
   const handleSelectConversation = useCallback((conv) => {
     setActiveConversation(conv._id);
     setReplyTo(null);
@@ -92,6 +132,7 @@ const Chat = () => {
     if (!exists) setConversations([conv, ...useChatStore.getState().conversations]);
   }, []);
 
+  // ── Start call (caller side) ───────────────────────────────────────
   const handleVoiceCall = () => {
     if (!otherUser) return;
     callStore.setRemoteUser(otherUser);
@@ -104,34 +145,32 @@ const Chat = () => {
     webRTC.startCall(otherUser._id, 'video');
   };
 
+  // ── Accept incoming call (callee side) ─────────────────────────────
   const handleAnswerCall = () => {
-    const { from, callType, offer } = incomingCallRef.current || {};
-    if (!from || !offer) return;
+    const { from, callType, offer } = incomingRef.current || {};
+    if (!from || !offer) {
+      console.error('[Answer] Missing call data', incomingRef.current);
+      return;
+    }
+    console.log('[Call] answering', callType, 'call from', from.displayName);
     webRTC.answerCall(from._id, callType, offer);
   };
 
+  // ── Reject incoming call ───────────────────────────────────────────
   const handleRejectCall = () => {
-    const { from } = incomingCallRef.current || {};
+    const { from } = incomingRef.current || {};
     if (from) getSocket()?.emit('call:reject', { targetUserId: from._id });
-    incomingCallRef.current = null;
+    incomingRef.current = null;
     callStore.resetCall();
   };
 
-  const handleEndCall = () => webRTC.endCall(true);
   const isTyping = typingUsers[activeConversationId];
-
-  // On mobile: show chat panel when conversation selected
-  const showChat = !!activeConv;
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'100dvh', background:'var(--bg-base)', overflow:'hidden' }}>
-      <Navbar
-        onMenuToggle={() => setSidebarOpen(o => !o)}
-        showMenu={sidebarOpen}
-      />
+      <Navbar onMenuToggle={() => setSidebarOpen(o => !o)} showMenu={sidebarOpen}/>
 
       <div style={{ display:'flex', flex:1, overflow:'hidden', position:'relative' }}>
-        {/* Sidebar */}
         <Sidebar
           onSelectConversation={handleSelectConversation}
           activeConversationId={activeConversationId}
@@ -139,52 +178,26 @@ const Chat = () => {
           onClose={() => setSidebarOpen(false)}
         />
 
-        {/* Chat area */}
-        <div
-          className="chat-panel"
-          style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minWidth:0 }}
-        >
+        <div className="chat-panel" style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minWidth:0 }}>
           {activeConv && otherUser ? (
             <>
-              {/* Mobile back button inside header row */}
               <div style={{ display:'flex', alignItems:'center', background:'var(--bg-surface)', borderBottom:'1px solid var(--border)', flexShrink:0 }}>
-                <button
-                  className="mobile-back-btn"
-                  onClick={() => { setActiveConversation(null); setSidebarOpen(false); }}
-                  style={{ background:'none', border:'none', color:'var(--text-secondary)', cursor:'pointer', padding:'0 4px 0 12px', height:64, display:'flex', alignItems:'center' }}
-                >
+                <button className="mobile-back-btn" onClick={() => setActiveConversation(null)}
+                  style={{ background:'none', border:'none', color:'var(--text-secondary)', cursor:'pointer', padding:'0 4px 0 12px', height:64, display:'flex', alignItems:'center' }}>
                   <ArrowLeft size={20}/>
                 </button>
                 <div style={{ flex:1 }}>
-                  <ChatHeader
-                    otherUser={otherUser}
-                    onVoiceCall={handleVoiceCall}
-                    onVideoCall={handleVideoCall}
-                    noBorder
-                  />
+                  <ChatHeader otherUser={otherUser} onVoiceCall={handleVoiceCall} onVideoCall={handleVideoCall} noBorder/>
                 </div>
               </div>
-
-              <MessageList
-                conversationId={activeConversationId}
-                otherUser={otherUser}
-                onReply={(msg) => setReplyTo(msg)}
-              />
+              <MessageList conversationId={activeConversationId} otherUser={otherUser} onReply={setReplyTo}/>
               <TypingIndicator isTyping={isTyping} displayName={otherUser?.displayName}/>
-              <InputBar
-                conversationId={activeConversationId}
-                emit={emit}
-                replyTo={replyTo}
-                onCancelReply={() => setReplyTo(null)}
-              />
+              <InputBar conversationId={activeConversationId} emit={emit} replyTo={replyTo} onCancelReply={() => setReplyTo(null)}/>
             </>
           ) : (
-            /* Empty state — desktop only (mobile shows sidebar) */
             <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:16, padding:40 }}>
               <div style={{ position:'relative' }}>
-                <div style={{ width:90, height:90, borderRadius:'50%', background:'var(--accent-soft)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:40 }}>
-                  💕
-                </div>
+                <div style={{ width:90, height:90, borderRadius:'50%', background:'var(--accent-soft)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:40 }}>💕</div>
                 <div style={{ position:'absolute', bottom:0, right:0, width:28, height:28, background:'var(--accent)', borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center' }}>
                   <Heart size={14} color="#fff"/>
                 </div>
@@ -198,9 +211,9 @@ const Chat = () => {
         </div>
       </div>
 
-      {/* Call overlays */}
+      {/* Call overlays — always mounted */}
       <IncomingCall onAnswer={handleAnswerCall} onReject={handleRejectCall}/>
-      <CallModal webRTC={{ ...webRTC, endCall: handleEndCall }}/>
+      <CallModal webRTC={webRTC}/>
     </div>
   );
 };
