@@ -1,0 +1,36 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: client   # change if your folder name is different
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      # 🔥 Create env file (your actual values)
+      - name: Create .env
+        run: |
+          echo "VITE_API_URL=https://justus-server.onrender.com/api" >> .env
+          echo "VITE_SOCKET_URL=https://justus-server.onrender.com" >> .env
+
+      - name: Build project
+        run: npm run build
